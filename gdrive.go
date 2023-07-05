@@ -6,12 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -20,6 +22,8 @@ import (
 	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/option"
 )
+
+var ErrFileExist = errors.New("file exist")
 
 type Config struct {
 	LocalFolderRoot  string
@@ -78,9 +82,9 @@ func (g *GDrive) Start() {
 }
 
 func (g *GDrive) Init() error {
+	folderName := g.getFolderName(g.config.RemoteFolderRoot)
 	files, err := g.driveService.Files.List().
-		Q(fmt.Sprintf("mimeType = 'application/vnd.google-apps.folder' and name = '%s'",
-			g.getFolderName(g.config.RemoteFolderRoot))).
+		Q(fmt.Sprintf("mimeType = 'application/vnd.google-apps.folder' and name = '%s'", folderName)).
 		Do()
 	if err != nil {
 		return err
@@ -94,10 +98,11 @@ func (g *GDrive) Init() error {
 		}
 	}
 	if !found {
-		fmt.Println("creating remote folder")
 		res, err := g.driveService.Files.Create(
-			&drive.File{Name: g.getFolderName(g.config.RemoteFolderRoot),
-				MimeType: "application/vnd.google-apps.folder"}).
+			&drive.File{
+				Name:     folderName,
+				MimeType: "application/vnd.google-apps.folder",
+			}).
 			Do()
 		if err != nil {
 			return err
@@ -125,38 +130,50 @@ func (g *GDrive) ExchangeOauthCode(code string) (*oauth2.Token, error) {
 }
 
 func (g *GDrive) StoreFile(ctx context.Context, fileInsertInfo *FileInsertInfo) error {
+	// check if file exist in local
+	localPath := g.localFullPath(fileInsertInfo.Filepath)
+	_, err := os.Stat(localPath)
+	if err != nil && !os.IsNotExist(err) && !fileInsertInfo.Replace {
+		return ErrFileExist
+	}
+
+	driveFile := g.getFileInCloud(ctx, fileInsertInfo.Filepath)
+	if driveFile != nil && !fileInsertInfo.Replace {
+		return ErrFileExist
+	}
+
 	// store it to google drive
 	reader := bytes.NewReader(fileInsertInfo.FileBytes)
-	res, err := g.driveService.Files.Create(
-		&drive.File{Name: g.convertToGDrive(fileInsertInfo.Filepath), Parents: []string{g.parentFolderID}}).
-		Media(reader).
-		Do()
+	res, err := g.uploadToCloud(ctx, fileInsertInfo.Filepath, reader, fileInsertInfo.Replace)
 	if err != nil {
 		return err
 	}
 
 	// store it to local folder
-	err = g.storeFile(ctx, fileInsertInfo.Filepath, fileInsertInfo.FileBytes)
+	err = g.storeFileToLocal(ctx, fileInsertInfo.Filepath, fileInsertInfo.FileBytes)
 	if err != nil {
 		return err
 	}
 
 	if g.dao != nil {
-		g.dao.Insert(ctx, &FileInfo{FileID: res.Id, LastAccess: time.Now(), Filepath: fileInsertInfo.Filepath,
-			Size: res.Size, MimeType: res.MimeType})
+		g.dao.InsertOrUpdate(ctx, &FileInfo{FileID: res.Id, LastAccess: time.Now(), Filepath: fileInsertInfo.Filepath,
+			Size: int64(len(fileInsertInfo.FileBytes)), MimeType: res.MimeType})
 	}
 
 	return nil
 }
 
 func (g *GDrive) TouchFile(ctx context.Context, filePathName string) error {
-	localPath := path.Join(g.config.LocalFolderRoot, filePathName)
+	localPath := g.localFullPath(filePathName)
 	_, err := os.Stat(localPath)
 	if err == nil {
+		if g.dao != nil {
+			g.dao.Touch(ctx, filePathName, time.Now())
+		}
 		return nil
 	}
 	files, err := g.driveService.Files.List().
-		Q(fmt.Sprintf("name = '%s' and '%s' in parents and trashed = false",
+		Q(fmt.Sprintf("name ='%s' and '%s' in parents and trashed = false",
 			g.convertToGDrive(filePathName), g.parentFolderID)).
 		Do()
 	if err != nil {
@@ -165,34 +182,103 @@ func (g *GDrive) TouchFile(ctx context.Context, filePathName string) error {
 	if len(files.Files) == 0 {
 		return errors.New("file not available on google drive")
 	}
-	for _, f := range files.Files {
-		fmt.Println(f.Name, f.Trashed)
-	}
 	resp, err := g.driveService.Files.Get(files.Files[0].Id).Download()
 	if err != nil {
 		return err
 	}
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
-	err = g.storeFile(ctx, filePathName, b)
+	err = g.storeFileToLocal(ctx, filePathName, b)
 	if err != nil {
 		return err
 	}
 	if g.dao != nil {
-		g.dao.Insert(ctx, &FileInfo{FileID: files.Files[0].Id, LastAccess: time.Now(), Filepath: filePathName,
-			Size: files.Files[0].Size, MimeType: files.Files[0].MimeType})
+		g.dao.InsertOrUpdate(ctx, &FileInfo{FileID: files.Files[0].Id, LastAccess: time.Now(), Filepath: filePathName,
+			Size: int64(len(b)), MimeType: files.Files[0].MimeType})
 	}
 	return nil
 }
 
-func (g *GDrive) storeFile(ctx context.Context, filePathName string, bytes []byte) error {
-	localPath := path.Join(g.config.LocalFolderRoot, filePathName)
+func (g *GDrive) UploadAll(ctx context.Context) error {
+	chanLimit := make(chan struct{}, 10)
+	wg := &sync.WaitGroup{}
+	filepath.Walk(g.config.LocalFolderRoot, func(path string, info fs.FileInfo, err error) error {
+		if info.IsDir() {
+			return nil
+		}
+		wg.Add(1)
+		go func(wg *sync.WaitGroup, limiter chan struct{}) {
+			limiter <- struct{}{}
+			defer func() {
+				wg.Done()
+				<-limiter
+			}()
+			rel, _ := filepath.Rel(g.config.LocalFolderRoot, path)
+			f, err := os.Open(path)
+			if err != nil {
+				logrus.WithError(err).Error("unable to open file in upload all")
+				return
+			}
+			b, err := io.ReadAll(f)
+			if err != nil {
+				logrus.WithError(err).Error("unable to read byte of the file in upload all")
+			}
+			logrus.WithField("path", path).Debug("uploading from upload all")
+			reader := bytes.NewReader(b)
+			res, err := g.uploadToCloud(ctx, rel, reader, false)
+			if err != nil {
+				logrus.WithError(err).Error("unable to store to google drive in upload all")
+			}
+			if g.dao != nil {
+				g.dao.InsertOrUpdate(ctx, &FileInfo{FileID: res.Id, LastAccess: time.Now(), Filepath: rel, Size: int64(len(b)), MimeType: res.MimeType})
+			}
+		}(wg, chanLimit)
+		return nil
+	})
+	wg.Wait()
+	return nil
+}
+
+func (g *GDrive) uploadToCloud(ctx context.Context, filepathName string, reader io.Reader, replace bool) (*drive.File, error) {
+	driveFile := g.getFileInCloud(ctx, filepathName)
+	if driveFile != nil && !replace {
+		return driveFile, nil
+	}
+	if driveFile == nil {
+		return g.driveService.Files.Create(
+			&drive.File{
+				Name:    g.convertToGDrive(filepathName),
+				Parents: []string{g.parentFolderID},
+			}).
+			Media(reader).
+			Do()
+	}
+	return g.driveService.Files.Update(driveFile.Id, driveFile).Media(reader).Do()
+}
+
+func (g *GDrive) getFileInCloud(ctx context.Context, filepathName string) *drive.File {
+	remoteName := g.convertToGDrive(filepathName)
+	files, err := g.driveService.Files.List().
+		Q(fmt.Sprintf("name ='%s' and '%s' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed = false",
+			remoteName, g.parentFolderID)).
+		Do()
+	if err != nil {
+		return nil
+	}
+	if len(files.Files) > 0 {
+		return files.Files[0]
+	}
+	return nil
+}
+
+func (g *GDrive) storeFileToLocal(ctx context.Context, filePathName string, bytes []byte) error {
+	localPath := g.localFullPath(filePathName)
 	dir := filepath.Dir(localPath)
 	_, err := os.Stat(dir)
 	if err != nil && os.IsNotExist(err) {
-		err = os.MkdirAll(dir, os.ModeDir)
+		err = os.MkdirAll(dir, os.ModePerm)
 		if err != nil {
 			return err
 		}
@@ -204,8 +290,21 @@ func (g *GDrive) storeFile(ctx context.Context, filePathName string, bytes []byt
 	return nil
 }
 
+func (g *GDrive) localFileExist(filePathName string) bool {
+	localPath := g.localFullPath(filePathName)
+	_, err := os.Stat(localPath)
+	if err != nil && os.IsNotExist(err) {
+		return false
+	}
+	return true
+}
+
+func (g *GDrive) localFullPath(pathName string) string {
+	return path.Join(g.config.LocalFolderRoot, pathName)
+}
+
 func (g *GDrive) getFolderName(name string) string {
-	return fmt.Sprintf("apin-%s", name)
+	return fmt.Sprintf("gdrive-%s", name)
 }
 
 func (g *GDrive) convertToGDrive(path string) string {
@@ -237,12 +336,12 @@ func (g *GDrive) shouldRemove() bool {
 				}
 			}
 			for _, rem := range toRemove {
-				err := g.dao.Delete(g.ctx, rem.FileID)
+				err := g.dao.Delete(g.ctx, rem.Filepath)
 				if err != nil {
 					logrus.WithError(err).Error("unable to remove from dao")
 					return false
 				}
-				err = os.Remove(filepath.Join(g.config.LocalFolderRoot, rem.Filepath))
+				err = os.Remove(g.localFullPath(rem.Filepath))
 				if err != nil {
 					logrus.WithError(err).Error("unable to remove file")
 					return false
@@ -254,4 +353,9 @@ func (g *GDrive) shouldRemove() bool {
 		}
 	}
 	return false
+}
+
+// this only for testing
+func (g *GDrive) deleteRootFolder(ctx context.Context) error {
+	return g.driveService.Files.Delete(g.parentFolderID).Do()
 }

@@ -5,6 +5,7 @@ import "time"
 type FileInsertInfo struct {
 	FileBytes []byte
 	Filepath  string
+	Replace   bool
 }
 
 type FileInfo struct {
